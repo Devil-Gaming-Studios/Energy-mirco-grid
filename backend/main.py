@@ -182,6 +182,7 @@ def backfill_from_weather(
         "window_start": w["timestamps"][0],
         "window_end": w["timestamps"][-1],
         "timezone": w["timezone"],
+        "stale": w.get("stale", False),
     }
 
 

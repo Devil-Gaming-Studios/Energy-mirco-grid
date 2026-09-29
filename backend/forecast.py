@@ -10,96 +10,132 @@ Load is currently a synthetic "typical daily campus/building" curve —
 swap `synthetic_load()` for a call to your real smart-meter / utility
 data source when you have one.
 """
+import json
 import math
+import os
+import threading
 import time
 from datetime import datetime, timedelta
 
 import requests
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+HOURLY_VARS = "shortwave_radiation,cloudcover,windspeed_10m,temperature_2m"
+
+CACHE_TTL_S = 3 * 3600          # serve cached data for 3h without touching the API
+                                # (NWP hourly data barely changes; saves quota)
+MAX_RETRY_WAIT_S = 10           # never block a request longer than this per retry
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".weather_cache.json")
+
+_cache: dict = {}               # key -> (fetched_at_epoch, raw_open_meteo_json)
+_cache_lock = threading.Lock()
+_cache_loaded = False
 
 
-import time
-import requests
+class WeatherUnavailable(RuntimeError):
+    """Open-Meteo is rate-limiting / down AND there is no cached data to fall back on."""
 
-import time
 
-weather_cache = {}
+def _load_disk_cache():
+    global _cache_loaded
+    if _cache_loaded:
+        return
+    _cache_loaded = True
+    try:
+        with open(CACHE_FILE) as f:
+            for k, v in json.load(f).items():
+                _cache[k] = (v["t"], v["data"])
+    except (OSError, ValueError, KeyError):
+        pass
 
-def fetch_weather(lat: float, lon: float, hours: int = 48) -> dict:
-    """Fetch and cache hourly weather data from Open-Meteo."""
 
-    key = f"{lat:.4f},{lon:.4f},{hours}"
-    now = time.time()
+def _save_disk_cache():
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump({k: {"t": t, "data": d} for k, (t, d) in _cache.items()}, f)
+    except OSError:
+        pass  # cache persistence is best-effort
 
-    cached = weather_cache.get(key)
 
-    if cached:
-        cached_time, cached_data = cached
+def _fetch_raw(lat: float, lon: float) -> tuple[dict, bool]:
+    """
+    One Open-Meteo request per location, shared by BOTH the forecast and the
+    72h backfill (3 past days + 2 forecast days covers everything), cached so
+    repeated UI clicks / dev-server reloads don't burn API quota.
 
-        if now - cached_time < 1800:
-            return cached_data
+    Returns (raw_json, is_stale). On 429 / network errors it honours
+    Retry-After (bounded), retries, and finally falls back to ANY cached copy
+    (even expired) before giving up.
+    """
+    key = f"{lat:.2f},{lon:.2f}"          # ~1 km grid; NWP resolution is coarser anyway
+    with _cache_lock:
+        _load_disk_cache()
+        cached = _cache.get(key)
+    if cached and time.time() - cached[0] < CACHE_TTL_S:
+        return cached[1], False
 
     params = {
         "latitude": lat,
         "longitude": lon,
-        "hourly": "shortwave_radiation,cloudcover,windspeed_10m,temperature_2m",
+        "hourly": HOURLY_VARS,
+        "past_days": 3,
         "forecast_days": 2,
         "timezone": "auto",
     }
-
+    last_err = "unknown error"
     for attempt in range(3):
         try:
-            resp = requests.get(
-                OPEN_METEO_URL,
-                params=params,
-                timeout=15,
-                headers={
-                    "User-Agent": "EnergyMicroGrid/1.0"
-                }
-            )
-
+            resp = requests.get(OPEN_METEO_URL, params=params, timeout=15,
+                                headers={"User-Agent": "EnergyMicroGrid/1.0"})
             if resp.status_code == 429:
+                last_err = "Open-Meteo rate limit reached"
+                try:
+                    wait = float(resp.headers.get("Retry-After", 2 ** (attempt + 1)))
+                except ValueError:
+                    wait = 2 ** (attempt + 1)
                 if attempt < 2:
-                    time.sleep(2 ** attempt)
-                    continue
-
-                if cached:
-                    return cached[1]
-
-                raise RuntimeError(
-                    "Open-Meteo rate limit reached. Please try again later."
-                )
-
+                    time.sleep(min(wait, MAX_RETRY_WAIT_S))
+                continue
             resp.raise_for_status()
-
             data = resp.json()
-            hourly = data["hourly"]
-
-            result = {
-                "timestamps": hourly["time"][:hours],
-                "radiation": hourly["shortwave_radiation"][:hours],
-                "cloudcover": hourly["cloudcover"][:hours],
-                "windspeed": hourly["windspeed_10m"][:hours],
-                "temperature": hourly["temperature_2m"][:hours],
-                "timezone": data.get("timezone", "UTC"),
-            }
-
-            weather_cache[key] = (time.time(), result)
-
-            return result
-
-        except requests.RequestException:
+            _ = data["hourly"]["time"]     # sanity check
+            with _cache_lock:
+                _cache[key] = (time.time(), data)
+                _save_disk_cache()
+            return data, False
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            last_err = str(exc)
             if attempt < 2:
                 time.sleep(2 ** attempt)
-                continue
 
-            if cached:
-                return cached[1]
+    if cached:                              # stale data beats no data
+        return cached[1], True
+    raise WeatherUnavailable(
+        f"{last_err}. No cached weather for this location yet - retry in a few "
+        f"minutes, or use 'Upload 72h history (.csv)' instead."
+    )
 
-            raise
 
-    raise RuntimeError("Weather API request failed")
+def fetch_weather(lat: float, lon: float, hours: int = 48) -> dict:
+    """Hourly forecast starting at today's local midnight, from the shared cached request."""
+    data, stale = _fetch_raw(lat, lon)
+    hourly = data["hourly"]
+    now_local = datetime.utcnow() + timedelta(seconds=data.get("utc_offset_seconds", 0))
+    times = hourly["time"]
+    start = next((i for i, t in enumerate(times)
+                  if datetime.fromisoformat(t).date() >= now_local.date()), 0)
+    sl = slice(start, start + hours)
+    return {
+        "timestamps": times[sl],
+        "radiation": [v or 0.0 for v in hourly["shortwave_radiation"][sl]],
+        "cloudcover": [v or 0.0 for v in hourly["cloudcover"][sl]],
+        "windspeed": [v or 0.0 for v in hourly["windspeed_10m"][sl]],
+        "temperature": [20.0 if v is None else v for v in hourly["temperature_2m"][sl]],
+        "timezone": data.get("timezone", "UTC"),
+        "stale": stale,
+    }
+
+
 def select_recent_window(hourly: dict, utc_offset_seconds: int, now_utc: datetime, hours: int = 72) -> dict:
     """
     From an Open-Meteo hourly block covering past days + today, pick the
@@ -133,25 +169,16 @@ def select_recent_window(hourly: dict, utc_offset_seconds: int, now_utc: datetim
 
 def fetch_recent_history(lat: float, lon: float, hours: int = 72) -> dict:
     """
-    Fetch the last `hours` (max 72) of hourly weather for a location: real
-    recent conditions used to fill the LSTM's input window. Open-Meteo's
-    `past_days` parameter returns the previous days alongside today.
+    Last `hours` (max 72) of hourly weather: real recent conditions used to fill
+    the LSTM's input window. Shares the cached request with fetch_weather, so
+    forecast + backfill together cost one API call per location per few hours.
     """
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "shortwave_radiation,cloudcover,windspeed_10m,temperature_2m",
-        "past_days": 3,
-        "forecast_days": 1,
-        "timezone": "auto",
-    }
-    resp = requests.get(OPEN_METEO_URL, params=params, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
+    data, stale = _fetch_raw(lat, lon)
     window = select_recent_window(
         data["hourly"], data.get("utc_offset_seconds", 0), datetime.utcnow(), hours
     )
     window["timezone"] = data.get("timezone", "UTC")
+    window["stale"] = stale
     return window
 
 

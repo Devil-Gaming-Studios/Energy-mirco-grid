@@ -19,11 +19,23 @@ from datetime import datetime, timedelta
 
 import requests
 
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_FREE_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_PAID_URL = "https://customer-api.open-meteo.com/v1/forecast"
+
+
+def _open_meteo_endpoint() -> tuple[str, dict]:
+    """Paid/commercial key (env OPEN_METEO_API_KEY) -> dedicated customer host; else free host."""
+    key = os.environ.get("OPEN_METEO_API_KEY", "").strip()
+    if key:
+        return OPEN_METEO_PAID_URL, {"apikey": key}
+    return OPEN_METEO_FREE_URL, {}
+
+
 HOURLY_VARS = "shortwave_radiation,cloudcover,windspeed_10m,temperature_2m"
 
 CACHE_TTL_S = 3 * 3600          # serve cached data for 3h without touching the API
                                 # (NWP hourly data barely changes; saves quota)
+FALLBACK_TTL_S = 600           # fallback data is re-tried against Open-Meteo after 10 min
 MAX_RETRY_WAIT_S = 10           # never block a request longer than this per retry
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".weather_cache.json")
 
@@ -57,6 +69,93 @@ def _save_disk_cache():
         pass  # cache persistence is best-effort
 
 
+MET_NO_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+
+
+def _utc_offset_hours(lat: float, lon: float) -> float:
+    """Best-effort timezone offset when Open-Meteo (which reports it) is unavailable.
+    Override with env WEATHER_UTC_OFFSET_HOURS for exact control."""
+    env = os.environ.get("WEATHER_UTC_OFFSET_HOURS")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    if 6 <= lat <= 36 and 68 <= lon <= 98:      # India / Sri Lanka: UTC+5:30
+        return 5.5
+    return round(lon / 15.0 * 2) / 2
+
+
+def _clear_sky_ghi(lat: float, lon: float, utc_dt: datetime) -> float:
+    """Approximate clear-sky global horizontal irradiance (W/m^2) from solar geometry."""
+    doy = utc_dt.timetuple().tm_yday
+    decl = math.radians(23.44) * math.sin(2 * math.pi * (284 + doy) / 365)
+    solar_time = utc_dt.hour + utc_dt.minute / 60 + lon / 15.0
+    ha = math.radians((solar_time - 12) * 15)
+    la = math.radians(lat)
+    sin_elev = math.sin(la) * math.sin(decl) + math.cos(la) * math.cos(decl) * math.cos(ha)
+    return 1050.0 * sin_elev ** 1.15 if sin_elev > 0 else 0.0
+
+
+def _fallback_raw(lat: float, lon: float) -> dict:
+    """
+    Last-resort weather when Open-Meteo refuses us, returned in Open-Meteo's own
+    JSON shape so nothing downstream changes.
+      - Forecast hours: real MET Norway (api.met.no) cloud / wind / temperature.
+      - Radiation: NOT provided by MET Norway, so it is estimated from solar
+        geometry x cloud attenuation (Kasten-Czeplak).
+      - Hours before 'now' (needed for the 72h backfill): MET Norway has no
+        history, so the earliest forecast values are held constant. These are
+        ESTIMATES and are labelled as such via `_source`.
+    """
+    offset = _utc_offset_hours(lat, lon)
+    steps, source = [], "estimated"
+    try:
+        resp = requests.get(
+            MET_NO_URL, params={"lat": round(lat, 4), "lon": round(lon, 4)}, timeout=15,
+            headers={"User-Agent": "EnergyMicroGrid/1.0 github.com/energy-microgrid"},
+        )
+        resp.raise_for_status()
+        for ts in resp.json()["properties"]["timeseries"]:
+            d = ts["data"]["instant"]["details"]
+            steps.append((
+                datetime.fromisoformat(ts["time"].replace("Z", "+00:00")).replace(tzinfo=None),
+                d.get("cloud_area_fraction", 25.0),
+                d.get("wind_speed", 3.3) * 3.6,                 # m/s -> km/h
+                d.get("air_temperature", 25.0),
+            ))
+        if steps:
+            source = "met.no+estimated-history"
+    except (requests.RequestException, ValueError, KeyError):
+        pass
+    if not steps:                                               # no network source at all
+        steps = [(datetime(2000, 1, 1), 25.0, 12.0, 25.0)]
+
+    now_local = datetime.utcnow() + timedelta(hours=offset)
+    start = (now_local - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+    out = {"time": [], "shortwave_radiation": [], "cloudcover": [],
+           "windspeed_10m": [], "temperature_2m": []}
+    for i in range(120):                                        # 3 past days + 2 forecast days
+        t_local = start + timedelta(hours=i)
+        t_utc = t_local - timedelta(hours=offset)
+        pick = steps[0]
+        for s in steps:                                         # latest step at or before t_utc
+            if s[0] <= t_utc:
+                pick = s
+            else:
+                break
+        _, cloud, wind, temp = pick
+        c = min(max(cloud / 100.0, 0.0), 1.0)
+        ghi = _clear_sky_ghi(lat, lon, t_utc) * (1 - 0.75 * c ** 3.4)
+        out["time"].append(t_local.strftime("%Y-%m-%dT%H:00"))
+        out["shortwave_radiation"].append(round(ghi, 1))
+        out["cloudcover"].append(cloud)
+        out["windspeed_10m"].append(round(wind, 1))
+        out["temperature_2m"].append(temp)
+    return {"hourly": out, "utc_offset_seconds": int(offset * 3600),
+            "timezone": f"UTC{offset:+g}", "_source": source}
+
+
 def _fetch_raw(lat: float, lon: float) -> tuple[dict, bool]:
     """
     One Open-Meteo request per location, shared by BOTH the forecast and the
@@ -71,8 +170,10 @@ def _fetch_raw(lat: float, lon: float) -> tuple[dict, bool]:
     with _cache_lock:
         _load_disk_cache()
         cached = _cache.get(key)
-    if cached and time.time() - cached[0] < CACHE_TTL_S:
-        return cached[1], False
+    if cached:
+        ttl = FALLBACK_TTL_S if cached[1].get("_source") else CACHE_TTL_S
+        if time.time() - cached[0] < ttl:
+            return cached[1], False
 
     params = {
         "latitude": lat,
@@ -82,13 +183,18 @@ def _fetch_raw(lat: float, lon: float) -> tuple[dict, bool]:
         "forecast_days": 2,
         "timezone": "auto",
     }
+    url, extra = _open_meteo_endpoint()
+    params.update(extra)
     last_err = "unknown error"
     for attempt in range(3):
         try:
-            resp = requests.get(OPEN_METEO_URL, params=params, timeout=15,
+            resp = requests.get(url, params=params, timeout=15,
                                 headers={"User-Agent": "EnergyMicroGrid/1.0"})
             if resp.status_code == 429:
-                last_err = "Open-Meteo rate limit reached"
+                try:
+                    last_err = "Open-Meteo rate limit reached: " + resp.json().get("reason", "")
+                except ValueError:
+                    last_err = "Open-Meteo rate limit reached"
                 try:
                     wait = float(resp.headers.get("Retry-After", 2 ** (attempt + 1)))
                 except ValueError:
@@ -110,10 +216,47 @@ def _fetch_raw(lat: float, lon: float) -> tuple[dict, bool]:
 
     if cached:                              # stale data beats no data
         return cached[1], True
-    raise WeatherUnavailable(
-        f"{last_err}. No cached weather for this location yet - retry in a few "
-        f"minutes, or use 'Upload 72h history (.csv)' instead."
-    )
+    print(f"[weather] Open-Meteo unavailable ({last_err}); using fallback source")
+    data = _fallback_raw(lat, lon)
+    with _cache_lock:
+        _cache[key] = (time.time(), data)
+        _save_disk_cache()
+    return data, False
+
+
+def store_browser_weather(lat: float, lon: float, raw: dict) -> int:
+    """
+    Accept an Open-Meteo forecast response that the user's BROWSER fetched
+    (its own IP has its own free quota) and put it in the shared cache, so the
+    server never has to call Open-Meteo itself from a shared/throttled IP.
+    Validates shape; returns the number of hourly rows stored.
+    """
+    hourly = raw.get("hourly") if isinstance(raw, dict) else None
+    if not isinstance(hourly, dict):
+        raise ValueError("missing 'hourly' block")
+    cols = ["time", "shortwave_radiation", "cloudcover", "windspeed_10m", "temperature_2m"]
+    for c in cols:
+        if not isinstance(hourly.get(c), list):
+            raise ValueError(f"hourly.{c} missing")
+    n = len(hourly["time"])
+    if not (24 <= n <= 400) or any(len(hourly[c]) != n for c in cols):
+        raise ValueError("hourly arrays must be equal length (24-400 rows)")
+    for c in cols[1:]:
+        if any(v is not None and not isinstance(v, (int, float)) for v in hourly[c]):
+            raise ValueError(f"hourly.{c} must be numeric")
+    for t in (hourly["time"][0], hourly["time"][-1]):
+        datetime.fromisoformat(t)                      # raises ValueError if malformed
+    clean = {
+        "hourly": {c: hourly[c] for c in cols},
+        "utc_offset_seconds": int(raw.get("utc_offset_seconds", 0)),
+        "timezone": str(raw.get("timezone", "UTC"))[:64],
+        "_via": "browser",
+    }
+    with _cache_lock:
+        _load_disk_cache()
+        _cache[f"{lat:.2f},{lon:.2f}"] = (time.time(), clean)
+        _save_disk_cache()
+    return n
 
 
 def fetch_weather(lat: float, lon: float, hours: int = 48) -> dict:
@@ -133,6 +276,7 @@ def fetch_weather(lat: float, lon: float, hours: int = 48) -> dict:
         "temperature": [20.0 if v is None else v for v in hourly["temperature_2m"][sl]],
         "timezone": data.get("timezone", "UTC"),
         "stale": stale,
+        "data_source": data.get("_source", "open-meteo"),
     }
 
 
@@ -179,6 +323,7 @@ def fetch_recent_history(lat: float, lon: float, hours: int = 72) -> dict:
     )
     window["timezone"] = data.get("timezone", "UTC")
     window["stale"] = stale
+    window["data_source"] = data.get("_source", "open-meteo")
     return window
 
 

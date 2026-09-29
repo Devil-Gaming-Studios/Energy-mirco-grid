@@ -35,6 +35,7 @@ import os
 import sensors
 import ml_model
 from forecast import (
+    store_browser_weather,
     fetch_recent_history,
     fetch_weather,
     solar_power_kw,
@@ -72,6 +73,25 @@ class SensorBatch(BaseModel):
     """Many hourly readings at once, oldest first (e.g. a site's logs, or the 3D twin's 3-day run)."""
     readings: List[SensorReading] = Field(..., min_length=1, max_length=500)
     replace_history: bool = True
+
+
+class BrowserWeather(BaseModel):
+    """Open-Meteo JSON fetched client-side (past_days=3, forecast_days=2, timezone=auto)."""
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-180, le=180)
+    data: dict
+
+
+@app.post("/api/weather/ingest")
+def ingest_browser_weather(body: BrowserWeather):
+    """Cache weather the browser fetched from Open-Meteo, so this server (often on a
+    shared, rate-limited IP such as Render) doesn't have to. /api/forecast and
+    /api/sensors/backfill-from-weather then read it from the cache."""
+    try:
+        n = store_browser_weather(body.lat, body.lon, body.data)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid weather payload: {exc}")
+    return {"status": "stored", "hours": n}
 
 
 @app.get("/api/health")
@@ -183,6 +203,7 @@ def backfill_from_weather(
         "window_end": w["timestamps"][-1],
         "timezone": w["timezone"],
         "stale": w.get("stale", False),
+        "data_source": w.get("data_source", "open-meteo"),
     }
 
 
@@ -297,6 +318,7 @@ def get_forecast(
 
     return {
         "source": source,
+        "data_source": weather.get("data_source"),
         "timestamps": weather["timestamps"],
         "timezone": weather["timezone"],
         "sensor_meta": weather.get("meta"),

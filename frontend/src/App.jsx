@@ -17,6 +17,59 @@ const DEFAULTS = {
   load_scale_kw: 50,
 }
 
+// ---- Browser-side Open-Meteo fetch --------------------------------------
+// Open-Meteo rate-limits by IP. The backend on a shared host (e.g. Render) shares
+// its IP with strangers, so we fetch from the user's own browser (own IP, own
+// free quota, CORS is allowed) and hand the result to the backend's cache.
+const OPEN_METEO = 'https://api.open-meteo.com/v1/forecast'
+const WEATHER_TTL_MS = 3 * 60 * 60 * 1000
+
+async function fetchOpenMeteoInBrowser(lat, lon) {
+  const key = `om:${lat.toFixed(2)},${lon.toFixed(2)}`
+  let stale = null
+  try {
+    const hit = JSON.parse(localStorage.getItem(key) || 'null')
+    if (hit) {
+      if (Date.now() - hit.t < WEATHER_TTL_MS) return hit.data
+      stale = hit.data
+    }
+  } catch { /* ignore corrupt cache */ }
+
+  try {
+    const res = await axios.get(OPEN_METEO, {
+      timeout: 15000,
+      params: {
+        latitude: lat,
+        longitude: lon,
+        hourly: 'shortwave_radiation,cloudcover,windspeed_10m,temperature_2m',
+        past_days: 3,
+        forecast_days: 2,
+        timezone: 'auto',
+      },
+    })
+    try {
+      localStorage.setItem(key, JSON.stringify({ t: Date.now(), data: res.data }))
+    } catch { /* storage full/blocked: fine */ }
+    return res.data
+  } catch (err) {
+    if (stale) return stale          // stale browser copy beats nothing
+    throw err
+  }
+}
+
+// Fetch in the browser and push to the backend cache. Never throws: if the
+// browser can't reach Open-Meteo either, the backend still tries its own fallbacks.
+async function pushBrowserWeather(lat, lon) {
+  try {
+    const data = await fetchOpenMeteoInBrowser(lat, lon)
+    await axios.post(`${API_URL}/api/weather/ingest`, { lat, lon, data })
+    return true
+  } catch (err) {
+    console.warn('Browser weather fetch/push failed; backend will use its own sources.', err)
+    return false
+  }
+}
+
 function clearSkyIrradiance(hourOfDay) {
   const x = Math.max(0, Math.sin(((hourOfDay - 6) / 12) * Math.PI))
   return 1000 * Math.pow(x, 1.1)
@@ -55,6 +108,9 @@ export default function App() {
     setError(null)
 
     try {
+      if (source === 'weather') {
+        await pushBrowserWeather(p.lat, p.lon)
+      }
       const res = await axios.get(`${API_URL}/api/forecast`, {
         params: {
           source,
@@ -307,6 +363,7 @@ export default function App() {
     })
 
     try {
+      await pushBrowserWeather(params.lat, params.lon)
       const res = await axios.post(
         `${API_URL}/api/sensors/backfill-from-weather`,
         null,
@@ -322,6 +379,7 @@ export default function App() {
       setBackfillStatus({
         ok: true,
         count: res.data.count,
+        dataSource: res.data.data_source,
       })
 
       await refreshHistoryStatus()
@@ -848,8 +906,10 @@ export default function App() {
 
             {backfillStatus?.ok && (
               <div className="upload-note ok">
-                Loaded {backfillStatus.count} real hours
-                from Open-Meteo.
+                {backfillStatus.dataSource &&
+                backfillStatus.dataSource !== 'open-meteo'
+                  ? `Loaded ${backfillStatus.count} hours of ESTIMATED weather (Open-Meteo is rate-limiting; using ${backfillStatus.dataSource}). Past hours are approximations, not measurements.`
+                  : `Loaded ${backfillStatus.count} real hours from Open-Meteo.`}
               </div>
             )}
 
@@ -1060,6 +1120,15 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {data?.data_source &&
+        data.data_source !== 'open-meteo' &&
+        data.source === 'weather' && (
+          <div className="upload-note bad">
+            Open-Meteo is rate-limiting; showing fallback weather ({data.data_source}).
+            Radiation is estimated from cloud cover. It will switch back automatically.
+          </div>
+        )}
 
       {error && (
         <div className="error">

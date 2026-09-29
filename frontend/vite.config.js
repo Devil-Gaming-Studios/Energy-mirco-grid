@@ -2,15 +2,15 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
-  plugins: [react()],
-  server: {
-    port: 5173,
-    proxy: {
-      // Forward /api requests to the FastAPI backend during local dev
-      '/api': {
-        target: 'http://127.0.0.1:8000',
-        changeOrigin: true,
-      },
-    },
-  },
+plugins: [react()],
+server: {
+port: 5173,
+proxy: {
+'/api': {
+target: 'https://energy-mirco-grid.onrender.com',
+changeOrigin: true,
+secure: true,
+},
+},
+},
 })

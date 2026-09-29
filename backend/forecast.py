@@ -10,16 +10,36 @@ Load is currently a synthetic "typical daily campus/building" curve —
 swap `synthetic_load()` for a call to your real smart-meter / utility
 data source when you have one.
 """
-
 import math
+import time
 from datetime import datetime, timedelta
+
 import requests
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 
+import time
+import requests
+
+import time
+
+weather_cache = {}
+
 def fetch_weather(lat: float, lon: float, hours: int = 48) -> dict:
-    """Fetch hourly solar radiation, wind speed, cloud cover and temperature."""
+    """Fetch and cache hourly weather data from Open-Meteo."""
+
+    key = f"{lat:.4f},{lon:.4f},{hours}"
+    now = time.time()
+
+    cached = weather_cache.get(key)
+
+    if cached:
+        cached_time, cached_data = cached
+
+        if now - cached_time < 1800:
+            return cached_data
+
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -27,21 +47,59 @@ def fetch_weather(lat: float, lon: float, hours: int = 48) -> dict:
         "forecast_days": 2,
         "timezone": "auto",
     }
-    resp = requests.get(OPEN_METEO_URL, params=params, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
 
-    hourly = data["hourly"]
-    return {
-        "timestamps": hourly["time"][:hours],
-        "radiation": hourly["shortwave_radiation"][:hours],   # W/m^2
-        "cloudcover": hourly["cloudcover"][:hours],            # %
-        "windspeed": hourly["windspeed_10m"][:hours],          # km/h
-        "temperature": hourly["temperature_2m"][:hours],       # deg C
-        "timezone": data.get("timezone", "UTC"),
-    }
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                OPEN_METEO_URL,
+                params=params,
+                timeout=15,
+                headers={
+                    "User-Agent": "EnergyMicroGrid/1.0"
+                }
+            )
 
+            if resp.status_code == 429:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
 
+                if cached:
+                    return cached[1]
+
+                raise RuntimeError(
+                    "Open-Meteo rate limit reached. Please try again later."
+                )
+
+            resp.raise_for_status()
+
+            data = resp.json()
+            hourly = data["hourly"]
+
+            result = {
+                "timestamps": hourly["time"][:hours],
+                "radiation": hourly["shortwave_radiation"][:hours],
+                "cloudcover": hourly["cloudcover"][:hours],
+                "windspeed": hourly["windspeed_10m"][:hours],
+                "temperature": hourly["temperature_2m"][:hours],
+                "timezone": data.get("timezone", "UTC"),
+            }
+
+            weather_cache[key] = (time.time(), result)
+
+            return result
+
+        except requests.RequestException:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+
+            if cached:
+                return cached[1]
+
+            raise
+
+    raise RuntimeError("Weather API request failed")
 def select_recent_window(hourly: dict, utc_offset_seconds: int, now_utc: datetime, hours: int = 72) -> dict:
     """
     From an Open-Meteo hourly block covering past days + today, pick the
